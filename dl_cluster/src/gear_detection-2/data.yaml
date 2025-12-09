@@ -1,0 +1,12 @@
+names:
+- gear
+nc: 1
+roboflow:
+  license: CC BY 4.0
+  project: gear_detection
+  url: https://universe.roboflow.com/clusteralab/gear_detection/dataset/2
+  version: 2
+  workspace: clusteralab
+test: ../test/images
+train: ../train/images
+val: ../valid/images
