@@ -5,7 +5,7 @@ data: C:\Users\박준형\Desktop\python-workspace\dl_cluster\src\gear_detection-
 epochs: 100
 time: null
 patience: 20
-batch: 16
+batch: 8
 imgsz: 640
 save: true
 save_period: -1

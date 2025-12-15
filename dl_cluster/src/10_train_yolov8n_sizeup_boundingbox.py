@@ -36,7 +36,7 @@ if __name__ == '__main__':
         data=f"{dataset.location}/data.yaml",
         epochs=100,
         imgsz=640,
-        batch=16,       # 2060 Super 최적값
+        batch=8,       # 2060 Super 최적값
         patience=20,    # 조기 종료
         device=0,       # GPU 사용
         workers=4,      
