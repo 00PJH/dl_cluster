@@ -1,0 +1,231 @@
+import cv2
+import numpy as np
+import os
+import pandas as pd
+from ultralytics import YOLO
+
+# ==========================================
+# 1. 설정 변수
+# ==========================================
+model_path = r'C:\Users\박준형\Desktop\python-workspace\dl_cluster\src\train_yolo8n_sizeup_boundingbox\weights\best.pt'
+input_folder = r'C:\Users\박준형\Desktop\python-workspace\dl_cluster\data'
+output_root_folder = r'C:\Users\박준형\Desktop\python-workspace\dl_cluster\20_final_morphology_filter'
+csv_save_path = os.path.join(output_root_folder, 'accuracy_report.csv')
+
+CROP_SIZE = 1500
+
+# [파라미터 튜닝]
+INNER_RATIO = 0.85
+OUTER_RATIO = 1.0
+DARKNESS_TOLERANCE = 60
+MIN_TOOTH_AREA = 55
+
+# [추가됨] 거리 필터링 허용 범위 (도넛 두께의 몇 % 안쪽에 있어야 하는가?)
+# 0.2: 도넛 두께의 가장자리 20% 영역에 있는 건 버림 (중앙 60%만 인정)
+EDGE_MARGIN_RATIO = 0.15 
+
+# ==========================================
+# 2. 모델 로드 & 유틸리티
+# ==========================================
+print(f"🔄 모델 로딩: {model_path}")
+try:
+    model = YOLO(model_path)
+except Exception as e:
+    exit()
+
+def imwrite_korean(filename, img):
+    try:
+        ext = os.path.splitext(filename)[1]
+        result, n = cv2.imencode(ext, img)
+        if result:
+            with open(filename, mode='w+b') as f: n.tofile(f)
+            return True
+        return False
+    except: return False
+
+def imread_korean(file_path):
+    try:
+        img_array = np.fromfile(file_path, np.uint8)
+        return cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    except: return None
+
+# ==========================================
+# 3. 핵심 로직
+# ==========================================
+def process_gear_final_v2(img, filename, save_dirs):
+    # 1. YOLO & Crop
+    results = model.predict(img, conf=0.5, verbose=False)
+    if len(results[0].boxes) == 0: return None
+
+    box = results[0].boxes[0].xyxy[0].cpu().numpy()
+    x1, y1, x2, y2 = map(int, box)
+    cx, cy = int((x1 + x2) / 2), int((y1 + y2) / 2)
+    box_radius = min(x2 - x1, y2 - y1) // 2
+
+    # Crop
+    h, w = img.shape[:2]
+    half = CROP_SIZE // 2
+    pad_l = abs(cx - half) if (cx - half) < 0 else 0
+    pad_t = abs(cy - half) if (cy - half) < 0 else 0
+    pad_r = (cx + half - w) if (cx + half) > w else 0
+    pad_b = (cy + half - h) if (cy + half) > h else 0
+    
+    if any([pad_l, pad_t, pad_r, pad_b]):
+        img = cv2.copyMakeBorder(img, pad_t, pad_b, pad_l, pad_r, cv2.BORDER_CONSTANT, value=(255, 255, 255))
+        cx += pad_l; cy += pad_t
+    
+    src_x1, src_y1 = cx - half, cy - half
+    src_x2, src_y2 = cx + half, cy + half
+    cropped = img[src_y1:src_y2, src_x1:src_x2].copy()
+    center_crop = (CROP_SIZE // 2, CROP_SIZE // 2)
+    
+    imwrite_korean(os.path.join(save_dirs['0_crop'], filename), cropped)
+
+    # 2. Masking & Preprocessing
+    mask_donut = np.zeros(cropped.shape[:2], dtype=np.uint8)
+    r_out = int(box_radius * OUTER_RATIO)
+    r_in = int(box_radius * INNER_RATIO)
+    cv2.circle(mask_donut, center_crop, r_out, 255, -1)
+    cv2.circle(mask_donut, center_crop, r_in, 0, -1)
+
+    hsv = cv2.cvtColor(cropped, cv2.COLOR_BGR2HSV)
+    _, _, v_ch = cv2.split(hsv)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    v_clahe = clahe.apply(v_ch)
+    
+    imwrite_korean(os.path.join(save_dirs['1_clahe'], filename), v_clahe)
+
+    # 3. Dynamic Threshold
+    valid_pixels = v_clahe[mask_donut > 0]
+    if len(valid_pixels) == 0: return None
+    min_val = np.min(valid_pixels)
+    dynamic_thresh = min_val + DARKNESS_TOLERANCE
+    
+    _, binary = cv2.threshold(v_clahe, dynamic_thresh, 255, cv2.THRESH_BINARY_INV)
+    binary_masked = cv2.bitwise_and(binary, binary, mask=mask_donut)
+    
+    imwrite_korean(os.path.join(save_dirs['2_binary'], filename), binary_masked)
+
+    # 4. [강화된 모폴로지] 끊어진 톱니 잇기
+    # 커널 크기를 키우고 반복 횟수를 늘려 확실하게 뭉칩니다.
+    kernel_close = np.ones((7, 7), np.uint8) 
+    binary_clean = cv2.morphologyEx(binary_masked, cv2.MORPH_CLOSE, kernel_close, iterations=3)
+    
+    # 노이즈 제거 (Open)
+    kernel_open = np.ones((3, 3), np.uint8)
+    binary_clean = cv2.morphologyEx(binary_clean, cv2.MORPH_OPEN, kernel_open, iterations=1)
+
+    imwrite_korean(os.path.join(save_dirs['3_morphology'], filename), binary_clean)
+
+    # 5. Contour Filtering (거리 & 면적)
+    contours, _ = cv2.findContours(binary_clean, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    final_img = cropped.copy()
+    teeth_count = 0
+    
+    # [핵심] 유효 거리 범위 계산 (도넛의 중앙 부분만 인정)
+    donut_width = r_out - r_in
+    margin = donut_width * EDGE_MARGIN_RATIO
+    valid_dist_min = r_in + margin
+    valid_dist_max = r_out - margin
+
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if area > MIN_TOOTH_AREA:
+            M = cv2.moments(cnt)
+            if M["m00"] != 0:
+                cx_t = int(M["m10"] / M["m00"])
+                cy_t = int(M["m01"] / M["m00"])
+                
+                # 거리 계산
+                dist = np.sqrt((cx_t - center_crop[0])**2 + (cy_t - center_crop[1])**2)
+                
+                # [이중 필터] 거리 & 면적 모두 만족해야 카운팅
+                if valid_dist_min <= dist <= valid_dist_max:
+                    teeth_count += 1
+                    cv2.drawContours(final_img, [cnt], -1, (0, 255, 0), 2)
+                    cv2.circle(final_img, (cx_t, cy_t), 5, (0, 0, 255), -1)
+
+    # 시각화 (유효 범위 파란선)
+    cv2.circle(final_img, center_crop, int(valid_dist_min), (255, 0, 0), 1)
+    cv2.circle(final_img, center_crop, int(valid_dist_max), (255, 0, 0), 1)
+    
+    cv2.putText(final_img, f"Count: {teeth_count}", (50, 100), cv2.FONT_HERSHEY_SIMPLEX, 2, (0, 255, 255), 4)
+    imwrite_korean(os.path.join(save_dirs['4_final_result'], filename), final_img)
+    
+    return teeth_count
+
+# ==========================================
+# 4. 실행
+# ==========================================
+if __name__ == '__main__':
+    print(f"🚀 [Final Morphology Filter] 시작")
+    os.makedirs(output_root_folder, exist_ok=True)
+    
+    step_folders = ['0_crop', '1_clahe', '2_binary', '3_morphology', '4_final_result']
+    save_dirs = {}
+    for folder in step_folders:
+        path = os.path.join(output_root_folder, folder)
+        save_dirs[folder] = path
+        os.makedirs(path, exist_ok=True)
+
+    results_list = []
+
+    for root, dirs, files in os.walk(input_folder):
+        bmp_files = [f for f in files if f.lower().endswith('.bmp')]
+        if not bmp_files: continue
+        
+        try:
+            rel_path = os.path.relpath(root, input_folder)
+        except:
+            rel_path = os.path.basename(root)
+            
+        current_save_dirs = {}
+        for key, path in save_dirs.items():
+            sub_path = os.path.join(path, rel_path)
+            os.makedirs(sub_path, exist_ok=True)
+            current_save_dirs[key] = sub_path
+
+        print(f"\n📂 처리 중: {rel_path}")
+
+        for file in bmp_files:
+            img_path = os.path.join(root, file)
+            img = imread_korean(img_path)
+            if img is None: continue
+            
+            pred_count = process_gear_final_v2(img, file, current_save_dirs)
+            
+            if pred_count is not None:
+                try:
+                    gt_count = int(file.split('_')[0])
+                    is_correct = (pred_count == gt_count)
+                except:
+                    gt_count = -1
+                    is_correct = False
+                
+                print(f"  - {file}: 정답={gt_count}, 예측={pred_count} -> {'O' if is_correct else 'X'}")
+                
+                results_list.append({
+                    'Folder': rel_path, 'Filename': file,
+                    'Ground_Truth': gt_count, 'Predicted': pred_count, 'Correct': is_correct
+                })
+
+    if results_list:
+        df = pd.DataFrame(results_list)
+        df.to_csv(csv_save_path, index=False, encoding='utf-8-sig')
+        valid_df = df[df['Ground_Truth'] != -1]
+        
+        if not valid_df.empty:
+            print("\n📊 [정확도 분석 결과]")
+            accuracy_report = valid_df.groupby('Ground_Truth').apply(
+                lambda x: pd.Series({
+                    'Total': len(x),
+                    'Correct': x['Correct'].sum(),
+                    'Accuracy(%)': (x['Correct'].sum() / len(x)) * 100
+                })
+            ).reset_index()
+            
+            print(accuracy_report)
+            summary_path = os.path.join(output_root_folder, 'accuracy_summary.csv')
+            accuracy_report.to_csv(summary_path, index=False, encoding='utf-8-sig')
+
+    print("\n✅ 완료. 20_final_morphology_filter 폴더 확인.")
